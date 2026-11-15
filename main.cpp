@@ -400,7 +400,7 @@ extern "C" void OnModLoad()
     sautils = (ISAUtils*)GetInterface("SAUtils");
     if(sautils != nullptr)
     {
-        sautils->AddSliderItem(Display, "Real Draw Distance", (int)fDrawDistance, 200, 4000, RealDrawDistanceChanged, RealDrawDistanceDraw);
+        sautils->AddSliderItem(Display, "Real Draw Distance", (int)fDrawDistance, 200, 1440, RealDrawDistanceChanged, RealDrawDistanceDraw);
         sautils->AddSliderItem(Display, "Streaming Distance Scale", (int)(100 * fStreamingScale), 100 * 0.25f, 100 * 5.0f, StreamingDistanceChanged, StreamingDistanceDraw);
     }
 }
