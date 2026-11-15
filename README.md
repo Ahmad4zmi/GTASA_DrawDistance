@@ -1,4 +1,4 @@
-# GTA:SA Draw Distance (v2.10 x64)
+# GTA:SA Draw Distance (v2.10 x64bit)
 
 An updated version of the original [GTASA_DrawDistance](https://github.com/AndroidModLoader/GTASA_DrawDistance) mod.
 
