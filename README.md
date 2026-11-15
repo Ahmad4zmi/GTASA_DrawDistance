@@ -10,7 +10,7 @@ It will not work on older versions like v2.00 or the 32-bit versions.
 
 ## Installation
 1. Download the latest release from the Releases tab (or compile the source).
-2. Place the `StreamingFix64.so` into your GTA:SA 'mods' folder.
+2. Place the `StreamingFix64.so` into your GTA:SA `mods` folder.
 3. Launch the game.
 4. Adjust the settings in inside Display option.
 
