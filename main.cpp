@@ -1,11 +1,10 @@
 #include <mod/amlmod.h>
 #include <mod/logger.h>
 #include <mod/config.h>
+#include <math.h>
 
 #include "isautils.h"
 ISAUtils* sautils = nullptr;
-
-#define THUMB_ADDRESS(_address)   ((_address) | 1)
 
 #if defined(__aarch64__)
     #define GTASA_ARM64 1
@@ -19,27 +18,21 @@ END_DEPLIST()
 
 /* Saves */
 uintptr_t pGTASA = 0;
-unsigned int nStreamingMemoryOverride;
-unsigned int nWaterBlocksToRender = 0;
-uintptr_t pointerWaterBlocksToRender = 0;
-float fRealAspectRatio = 0.0f;
-float fAspectRatioScaler = 0.0f;
-float flDontGetCfgValueEveryTick = 0.0f;
+int nStreamingMemoryOverride = 0; // bytes
+unsigned int nWaterBlocksToRender = 0; // used by the 32-bit asm, keep it global!
+uintptr_t pointerWaterBlocksToRender = 0; // used by the 32-bit asm, keep it global!
 
-/* Configs */
-ConfigEntry* pNearClipOverride;
-ConfigEntry* pDrawDistanceOverride;
-ConfigEntry* pStreamingDistanceScale;
-ConfigEntry* pHiWaterDistanceScale;
+/* Cached config values (read every frame, so never parse the config there) */
+float fNearClip = 0.0f;         // 0 = don't override
+float fDrawDistance = 800.0f;   // <= 200 = don't override
+float fStreamingScale = 1.0f;
+float fMaxDepthRatio = 8192.0f; // far / near limit, 0 = don't limit
+float fLastFarClip = 0.0f;      // last far plane of the main camera
 
 /* Lib Pointers */
-void* maincamera; // RwCamera*
 int* streamingMemoryAvailable;
-void* gMobileMenu;
-float* CameraRangeMinX;
-float* CameraRangeMaxX;
-float* CameraRangeMinY;
-float* CameraRangeMaxY;
+
+#define DEFAULT_DRAWDISTANCE 800.0f
 
 #ifdef GTASA_ARM64
     // CCamera::LODDistMultiplier / GenerationDistMultiplier
@@ -48,6 +41,8 @@ float* CameraRangeMaxY;
 #else
     #define CCAMERA_LOD_DIST_MULT 236
     #define CCAMERA_GEN_DIST_MULT 240
+
+    void* maincamera = nullptr; // RwCamera*
 #endif
 
 /* Realloc */
@@ -56,35 +51,85 @@ int16_t* pBlocksToBeRenderedOutsideWorldY;
 
 /* Functions Pointers */
 typedef float (*RetFloatFn)();
+typedef unsigned int (*RetUIntFn)();
+
+/* Main RwCamera */
+static inline void* GetMainCamera()
+{
+#ifdef GTASA_ARM64
+    return *(void**)(pGTASA + 0xC9B378); // Scene.camera (Scene @ 0xC9B370, camera is at +8)
+#else
+    return maincamera;
+#endif
+}
+
+/* Real screen aspect ratio. Lazy: the screen size is not known yet when the mod loads. */
+static float GetRealAspectRatio()
+{
+    static float fCached = 0.0f;
+    if(fCached > 0.0f) return fCached;
+
+    float fRatio;
+#ifdef GTASA_ARM64
+    float w = (float)((RetUIntFn)(pGTASA + 0x31E0B8))(); // OS_ScreenGetWidth
+    float h = (float)((RetUIntFn)(pGTASA + 0x31E0C8))(); // OS_ScreenGetHeight
+    if(w < 1.0f || h < 1.0f) return 4.0f / 3.0f;         // not ready yet, try again next time
+    fRatio = w / h;
+#else
+    fRatio = ((RetFloatFn)(pGTASA + 0x18E984))();
+#endif
+    if(!isfinite(fRatio) || fRatio <= 0.0f) return 4.0f / 3.0f;
+    if(fRatio < 1.0f) fRatio = 1.0f / fRatio;
+    return fCached = fRatio;
+}
 
 DECL_HOOK(void*, RwCameraSetNearClipPlane, void* self, float a1)
 {
-    if(self == maincamera && pNearClipOverride->GetFloat() > 0.0f)
+    if(self == GetMainCamera())
     {
-        return RwCameraSetNearClipPlane(self, pNearClipOverride->GetFloat());
+        float fNear = (fNearClip > 0.0f) ? fNearClip : a1;
+
+        // Depth buffer precision depends on far/near. With a huge far plane and a tiny near plane
+        // the depth buffer runs out of precision and the textures flicker (z-fighting).
+        // So the near plane is raised just enough to keep far/near under the limit.
+        if(fMaxDepthRatio > 0.0f && fLastFarClip > 0.0f)
+        {
+            float fMinNear = fLastFarClip / fMaxDepthRatio;
+            if(fNear < fMinNear) fNear = fMinNear;
+        }
+        a1 = fNear;
     }
     return RwCameraSetNearClipPlane(self, a1);
 }
+
 DECL_HOOK(void*, RwCameraSetFarClipPlane, void* self, float a1)
 {
-    if(self == maincamera && pDrawDistanceOverride->GetInt() > 200)
-        return RwCameraSetFarClipPlane(self, pDrawDistanceOverride->GetFloat());
+    if(self == GetMainCamera())
+    {
+        if(fDrawDistance > 200.0f) a1 = fDrawDistance;
+        fLastFarClip = a1;
+    }
     return RwCameraSetFarClipPlane(self, a1);
 }
 
+#ifndef GTASA_ARM64
 DECL_HOOK(void*, CameraCreate, int a1, int a2, int a3)
 {
     maincamera = CameraCreate(a1, a2, a3);
     return maincamera;
 }
+#endif
 
 DECL_HOOK(void*, CameraProcess, uintptr_t self)
 {
-    fAspectRatioScaler = fRealAspectRatio * 0.75 * pStreamingDistanceScale->GetFloat(); // AspectRatio / 4:3
-    
+    float fScaler = GetRealAspectRatio() * 0.75f * fStreamingScale; // AspectRatio / 4:3
+
     void* ret = CameraProcess(self);
-    *(float*)(self + CCAMERA_LOD_DIST_MULT) *= fAspectRatioScaler;
-    *(float*)(self + CCAMERA_GEN_DIST_MULT) *= fAspectRatioScaler;
+    if(isfinite(fScaler) && fScaler > 0.0f)
+    {
+        *(float*)(self + CCAMERA_LOD_DIST_MULT) *= fScaler;
+        *(float*)(self + CCAMERA_GEN_DIST_MULT) *= fScaler;
+    }
     return ret;
 }
 
@@ -96,38 +141,28 @@ DECL_HOOK(void*, CStreamingUpdate, void* self)
 }
 
 // SAUtils
-#define DEFAULT_DRAWDISTANCE 800.0f
-char szRetDrawDistanceSlider[12];
+char szSliderText[16];
 void RealDrawDistanceChanged(int oldVal, int newVal)
 {
-    pDrawDistanceOverride->SetInt(newVal);
+    fDrawDistance = (float)newVal;
+    cfg->Bind("DrawDistance", "800.0")->SetInt(newVal);
     cfg->Save();
 }
 const char* RealDrawDistanceDraw(int nNewValue)
 {
-    sprintf(szRetDrawDistanceSlider, "x%.2f", (nNewValue / DEFAULT_DRAWDISTANCE));
-    return szRetDrawDistanceSlider;
+    snprintf(szSliderText, sizeof(szSliderText), "x%.2f", (nNewValue / DEFAULT_DRAWDISTANCE));
+    return szSliderText;
 }
 void StreamingDistanceChanged(int oldVal, int newVal)
 {
-    pStreamingDistanceScale->SetFloat(0.01f * newVal);
+    fStreamingScale = 0.01f * newVal;
+    cfg->Bind("StreamingDistanceScale", "1.0")->SetFloat(fStreamingScale);
     cfg->Save();
 }
 const char* StreamingDistanceDraw(int nNewValue)
 {
-    sprintf(szRetDrawDistanceSlider, "x%.2f", (nNewValue / 100.0f));
-    return szRetDrawDistanceSlider;
-}
-void HiWaterDistanceChanged(int oldVal, int newVal)
-{
-    pHiWaterDistanceScale->SetFloat(0.01f * newVal);
-    flDontGetCfgValueEveryTick = pHiWaterDistanceScale->GetFloat();
-    cfg->Save();
-}
-const char* HiWaterDistanceDraw(int nNewValue)
-{
-    sprintf(szRetDrawDistanceSlider, "%d%%", nNewValue);
-    return szRetDrawDistanceSlider;
+    snprintf(szSliderText, sizeof(szSliderText), "x%.2f", (nNewValue / 100.0f));
+    return szSliderText;
 }
 
 #ifndef GTASA_ARM64
@@ -141,13 +176,13 @@ TARGET_THUMB ASM_NAKED void HitWaterBlock_JMP()
         "LDR R1, =(nWaterBlocksToRender - 100001f - 2*(100002f-100001f))\n" // Copy contents of variable to R0
         "100001:\nADD R1, PC\n100002:\n"
         "LDR R1, [R1]\n"
-        
+
         "CMP R0, R1\n" // Compare R0=nWaterBlocksToRender with R1=m_NumBlocksOutsideWorldToBeRendered
         "POP {R1}\n" // Bring back R1
 
-		"IT GT\n"
-		"POPGT {R4,R5,R7,PC}\n"
-		"LDR R1, =(0x6777C4 - 0x59869C)\n"
+        "IT GT\n"
+        "POPGT {R4,R5,R7,PC}\n"
+        "LDR R1, =(0x6777C4 - 0x59869C)\n"
 
         "PUSH {R0,R1}\n"
         "LDR R0, =(pointerWaterBlocksToRender - 100001f - 2*(100002f-100001f))\n" // Copy contents of variable to R0
@@ -156,7 +191,7 @@ TARGET_THUMB ASM_NAKED void HitWaterBlock_JMP()
         "STR R0, [SP, #4]\n"
         "POP {R0,PC}\n"
     );
-} 
+}
 
 void CodeRedirect(uintptr_t address, uintptr_t newAddress, bool isThumb)
 {
@@ -182,12 +217,11 @@ void CodeRedirect(uintptr_t address, uintptr_t newAddress, bool isThumb)
         return;
     }
 
-	char code[8];
-	*(uint32_t*)(code + 0) = 0xE51FF004;
-	*(const void**)(code + 4) = (const void*)newAddress;
+    char code[8];
+    *(uint32_t*)(code + 0) = 0xE51FF004;
+    *(const void**)(code + 4) = (const void*)newAddress;
     aml->Write(address, (uintptr_t)code, sizeof(code));
 }
-
 #endif // !GTASA_ARM64
 
 #ifdef GTASA_ARM64
@@ -211,46 +245,43 @@ static bool A64_Patch(uintptr_t offset, uint32_t expected, uint32_t value, const
 }
 #endif // GTASA_ARM64
 
-DECL_HOOK(void, emu_SetWater, bool set)
-{
-    emu_SetWater(set);
-    if(set)
-    {
-        //*CameraRangeMinX *= flDontGetCfgValueEveryTick;
-        *CameraRangeMaxX *= flDontGetCfgValueEveryTick;
-        //*CameraRangeMinY *= flDontGetCfgValueEveryTick;
-        *CameraRangeMaxY *= flDontGetCfgValueEveryTick;
-    }
-}
-
 extern "C" void OnModLoad()
 {
     logger->SetTag("GTASA Draw Distance");
     pGTASA = aml->GetLib("libGTASA.so");
+    if(pGTASA == 0)
+    {
+        logger->Error("libGTASA.so was not found, nothing to do");
+        return;
+    }
 
-    pNearClipOverride = cfg->Bind("NearClip", "0.1");
-    pDrawDistanceOverride = cfg->Bind("DrawDistance", "800.0");
-    nStreamingMemoryOverride = cfg->Bind("PreferredStreamingMemMB", "1024")->GetInt() * 1024 * 1024;
+    fNearClip = cfg->Bind("NearClip", "0.1")->GetFloat();
+    fDrawDistance = cfg->Bind("DrawDistance", "800.0")->GetFloat();
+    fStreamingScale = cfg->Bind("StreamingDistanceScale", "1.0")->GetFloat();
+    fMaxDepthRatio = cfg->Bind("MaxDepthRatio", "8192")->GetFloat(); // far/near limit (fixes the flickering), 0 = off
     nWaterBlocksToRender = (unsigned int)cfg->Bind("WaterBlocksToRender", "384")->GetInt();
-    pStreamingDistanceScale = cfg->Bind("StreamingDistanceScale", "1.0");
+
+    int nStreamingMemMB = cfg->Bind("PreferredStreamingMemMB", "1024")->GetInt();
+    if(nStreamingMemMB > 2047)
+    {
+        logger->Error("PreferredStreamingMemMB is too big (max 2047)");
+        nStreamingMemMB = 2047;
+    }
+    nStreamingMemoryOverride = (nStreamingMemMB > 0 ? nStreamingMemMB : 0) * 1024 * 1024;
 
 #ifdef GTASA_ARM64
     /* ===== arm64-v8a (offsets for the 64-bit libGTASA.so) ===== */
-    fRealAspectRatio = ((RetFloatFn)(pGTASA + 0x6C9CC8))(); // CDraw::CalculateAspectRatio
-    if(fRealAspectRatio < 1.0f) fRealAspectRatio = 1.0f / fRealAspectRatio;
     streamingMemoryAvailable = (int*)(pGTASA + 0x85EBD8);  // CStreaming::ms_memoryAvailable
-
-    gMobileMenu = (void*)(pGTASA + 0x8BE780);
 
     if(nWaterBlocksToRender > 1)
     {
         if(nWaterBlocksToRender > 70) // Default value is 0-69 (70) so don`t override if not necessary
         {
             // GOT slots of CWaterLevel::m_BlocksToBeRenderedOutsideWorld{X,Y}
-            pBlocksToBeRenderedOutsideWorldX = new int16_t[nWaterBlocksToRender];
+            pBlocksToBeRenderedOutsideWorldX = new int16_t[nWaterBlocksToRender]();
             aml->Write(pGTASA + 0x84CFB0, (uintptr_t)&pBlocksToBeRenderedOutsideWorldX, sizeof(void*));
 
-            pBlocksToBeRenderedOutsideWorldY = new int16_t[nWaterBlocksToRender];
+            pBlocksToBeRenderedOutsideWorldY = new int16_t[nWaterBlocksToRender]();
             aml->Write(pGTASA + 0x84F530, (uintptr_t)&pBlocksToBeRenderedOutsideWorldY, sizeof(void*));
         }
         --nWaterBlocksToRender;
@@ -265,7 +296,6 @@ extern "C" void OnModLoad()
     HOOKPLT(RwCameraSetNearClipPlane, pGTASA + 0x841838);
     HOOKPLT(RwCameraSetFarClipPlane, pGTASA + 0x846D60);
 
-    HOOK(CameraCreate, pGTASA + 0x55B978); // called inside the lib directly, no GOT slot -> inline hook
     HOOKPLT(CameraProcess, pGTASA + 0x8429D8);
 
     HOOKPLT(CStreamingUpdate, pGTASA + 0x845FD0);
@@ -301,20 +331,16 @@ extern "C" void OnModLoad()
     }
 #else
     /* ===== armeabi-v7a (offsets for the 32-bit libGTASA.so) ===== */
-    fRealAspectRatio = ((RetFloatFn)(pGTASA + 0x18E984))();
-    if(fRealAspectRatio < 1.0f) fRealAspectRatio = 1.0f / fRealAspectRatio;
     streamingMemoryAvailable = (int*)(pGTASA + 0x685FA0);
-
-    gMobileMenu = (void*)(pGTASA + 0x6E006C);
 
     if(nWaterBlocksToRender > 1)
     {
         if(nWaterBlocksToRender > 70) // Default value is 0-69 (70) so don`t override if not necessary
         {
-            pBlocksToBeRenderedOutsideWorldX = new int16_t[nWaterBlocksToRender];
+            pBlocksToBeRenderedOutsideWorldX = new int16_t[nWaterBlocksToRender]();
             aml->Write(pGTASA + 0x6777C4, (uintptr_t)&pBlocksToBeRenderedOutsideWorldX, sizeof(void*));
 
-            pBlocksToBeRenderedOutsideWorldY = new int16_t[nWaterBlocksToRender];
+            pBlocksToBeRenderedOutsideWorldY = new int16_t[nWaterBlocksToRender]();
             aml->Write(pGTASA + 0xA1C05C, (uintptr_t)&pBlocksToBeRenderedOutsideWorldY, sizeof(void*));
         }
         --nWaterBlocksToRender;
@@ -335,14 +361,14 @@ extern "C" void OnModLoad()
         aml->Unprot(pGTASA + 0x3F40C0, sizeof(char));
         *(char*)(pGTASA + 0x3F40C0) = 2;
     }
-    
+
     // Do not delete vehicles behind the player camera
     bool bRemoveCarsBehind = cfg->Bind("DontRemoveVehicleBehindCamera", "1")->GetBool();
     if(bRemoveCarsBehind)
     {
         aml->PlaceJMP(pGTASA + 0x2EC660, pGTASA + 0x2EC6D6);
     }
-    
+
     // Do not delete peds behind the player camera
     if(cfg->Bind("DontRemovePedBehindCamera", "1")->GetBool())
     {
@@ -369,23 +395,12 @@ extern "C" void OnModLoad()
             *(char*)(pGTASA + 0x2E866F) = 0xDB;
         }
     }
-
-    /* Unstable + Useless */
-    //pHiWaterDistanceScale = cfg->Bind("HighWaterDistanceScale", 1.0f);
-    //flDontGetCfgValueEveryTick = pHiWaterDistanceScale->GetFloat();
-    //CameraRangeMinX = (float*)(pGTASA + 0xA1DC8C);
-    //CameraRangeMaxX = (float*)(pGTASA + 0xA1DC90);
-    //CameraRangeMinY = (float*)(pGTASA + 0xA1DC94);
-    //CameraRangeMaxY = (float*)(pGTASA + 0xA1DC98);
-    //HOOKPLT(emu_SetWater, pGTASA + 0x673530);
-
 #endif // GTASA_ARM64
 
     sautils = (ISAUtils*)GetInterface("SAUtils");
     if(sautils != nullptr)
     {
-        sautils->AddSliderItem(Display, "Real Draw Distance", pDrawDistanceOverride->GetInt(), 200, 4000, RealDrawDistanceChanged, RealDrawDistanceDraw);
-        sautils->AddSliderItem(Display, "Streaming Distance Scale", 100 * pStreamingDistanceScale->GetFloat(), 100 * 0.25f, 100 * 5.0f, StreamingDistanceChanged, StreamingDistanceDraw);
-        //sautils->AddSliderItem(Display, "Detailed Water Draw Distance", 100 * pHiWaterDistanceScale->GetFloat(), 0, 100 * 5.0f, HiWaterDistanceChanged, HiWaterDistanceDraw);
+        sautils->AddSliderItem(Display, "Real Draw Distance", (int)fDrawDistance, 200, 4000, RealDrawDistanceChanged, RealDrawDistanceDraw);
+        sautils->AddSliderItem(Display, "Streaming Distance Scale", (int)(100 * fStreamingScale), 100 * 0.25f, 100 * 5.0f, StreamingDistanceChanged, StreamingDistanceDraw);
     }
 }
