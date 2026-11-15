@@ -10,7 +10,7 @@ ISAUtils* sautils = nullptr;
     #define GTASA_ARM64 1
 #endif
 
-MYMODCFG(net.rusjj.gtasa.drawdistance, GTA:SA Draw Distance, 1.1, RusJJ)
+MYMODCFG(net.aml.gtasa.streamingfix, GTA:SA Draw Distance, 1.1, RusJJ)
 NEEDGAME(com.rockstargames.gtasa)
 BEGIN_DEPLIST()
     ADD_DEPENDENCY_VER(net.rusjj.aml, 1.0)
