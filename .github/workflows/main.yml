@@ -25,33 +25,28 @@ jobs:
           ndk-version: r27c
           link-to-sdk: false
 
+      # ABI (arm64-v8a) is set in Application.mk
       - name: Build with ndk-build
         run: |
           "${{ steps.ndk.outputs.ndk-path }}/ndk-build" \
             NDK_PROJECT_PATH=. \
             APP_BUILD_SCRIPT=Android.mk \
             NDK_APPLICATION_MK=Application.mk \
+            APP_PLATFORM=android-21 \
             NDK_OUT=obj \
             NDK_LIBS_OUT=libs \
             -j"$(nproc)"
 
-      - name: List output
-        run: find libs -name '*.so' -exec ls -l {} +
-
-      - name: Package per-ABI
+      - name: Package
         run: |
           mkdir -p dist
-          for abi in libs/*/; do
-            name=$(basename "$abi")
-            zip -j "dist/GTASA_DrawDistance-${name}.zip" "$abi"*.so
-          done
+          zip -j dist/GTASA_DrawDistance-arm64-v8a.zip libs/arm64-v8a/*.so
 
-      - name: Upload artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GTASA_DrawDistance
-          path: |
-            libs/**/*.so
+          name: GTASA_DrawDistance-arm64-v8a
+          path: libs/arm64-v8a/*.so
           if-no-files-found: error
 
       - name: Publish release
