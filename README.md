@@ -2,7 +2,7 @@
 
 An updated version of the original [GTASA_DrawDistance](https://github.com/AndroidModLoader/GTASA_DrawDistance) mod.
 
-This repository provides a fix/update for the Draw Distance mod, specifically tailored for the **x64-bit** version of the game.
+This repository provides a fix/update for the StreamDistance mod, specifically tailored for the **x64-bit** version of the game.
 
 ## ⚠️ Compatibility
 **This mod is ONLY compatible with GTA: San Andreas v2.10 (x64bit).**
